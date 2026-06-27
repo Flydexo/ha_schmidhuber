@@ -1,0 +1,7 @@
+trackio:
+    write_url: ??
+    project: 'ha_schmidhuber'
+    run_name: 'test'
+dataset:
+    episodes: 100
+    lancedb_uri: 'db'
