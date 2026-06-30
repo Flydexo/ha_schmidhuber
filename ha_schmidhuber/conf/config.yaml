@@ -1,7 +1,7 @@
 trackio:
     write_url: ??
     project: 'ha_schmidhuber'
-    run_name: 'plain'
+    run_name: '<10k'
 dataset:
     episodes: 10000
     lancedb_uri: 'db'
