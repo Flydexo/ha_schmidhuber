@@ -102,25 +102,35 @@ class MDN(nn.Module):
         return Normal(mu_k, sigma_k).sample()                               # (B, 32)
 
     @staticmethod
-    def loss(pi, mu, sigma, target):
-        # NLL of target under the mixture: -log Σ_k π_k · N(target; μ_k, σ_k)
-        # target: (B, 32)
-        log_pi = torch.log(pi + 1e-8)                                       # (B, 5)
-        log_prob = Normal(mu, sigma).log_prob(target.unsqueeze(1))          # (B, 5, 32)
-        return -torch.logsumexp(log_pi + log_prob.sum(-1), dim=-1).mean()   # scalar
+    def loss(pi, mu, sigma, target, mask=None):
+        # Works for any prefix shape: (B, 32) or (B, T, 32)
+        log_pi = torch.log(pi + 1e-8)                                       # (..., K)
+        log_prob = Normal(mu, sigma).log_prob(target.unsqueeze(-2))         # (..., K, 32)
+        nll = -torch.logsumexp(log_pi + log_prob.sum(-1), dim=-1)           # (...)
+        return nll[mask].mean() if mask is not None else nll.mean()
     
 
 class RNN(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.lstm = LSTM(cfg.rnn.z_dim + cfg.rnn.action_dim, cfg.rnn.hidden_size)
+        self.lstm = LSTM(cfg.rnn.z_dim + cfg.rnn.action_dim, cfg.rnn.hidden_size, batch_first=True)
         self.mdn = MDN(cfg)
 
     def forward(self, z, a, hidden=None):
-        # z: (T, z_dim) or (1, z_dim), a: (T, action_dim)
-        # unsqueeze(1) adds batch dim → (T, 1, 35); LSTM treats dim 0 as seq_len
-        x = torch.cat([z, a], dim=-1).unsqueeze(1)   # (T, 1, 35)
-        output, hidden = self.lstm(x, hidden)         # output: (T, 1, 256)
-        pi, mu, sigma = self.mdn(output.squeeze(1))   # (T, 256) → (T, ...)
-        return pi, mu, sigma, hidden
+        # z: (B, T, z_dim) or (T, z_dim) for single episode
+        # a: (B, T, action_dim) or (T, action_dim)
+        x = torch.cat([z, a], dim=-1)                 # (B, T, 35) or (T, 35)
+        if x.dim() == 2:
+            x, squeeze = x.unsqueeze(0), True
+        else:
+            squeeze = False
+        output, hidden = self.lstm(x, hidden)          # (B, T, 256)
+        B, T, H = output.shape
+        pi, mu, sigma = self.mdn(output.reshape(B * T, H))
+        pi    = pi.view(B, T, self.mdn.gaussians)
+        mu    = mu.view(B, T, self.mdn.gaussians, self.mdn.z_dim)
+        sigma = sigma.view(B, T, self.mdn.gaussians, self.mdn.z_dim)
+        if squeeze:
+            pi, mu, sigma, output = pi.squeeze(0), mu.squeeze(0), sigma.squeeze(0), output.squeeze(0)
+        return pi, mu, sigma, hidden, output
         

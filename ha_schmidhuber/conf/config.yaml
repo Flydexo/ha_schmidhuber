@@ -1,9 +1,9 @@
 trackio:
     write_url: ??
     project: 'ha_schmidhuber'
-    run_name: 'test-9'
+    run_name: 'plain'
 dataset:
-    episodes: 1000
+    episodes: 10000
     lancedb_uri: 'db'
     max_episode_steps: 300
     img_size: 64
@@ -15,7 +15,7 @@ training:
         lr: 0.001
     rnn:
         nb_epochs: 20
-        lr: 0.001
+        lr: 0.01
 rnn:
     hidden_size: 256
     num_mix: 5
