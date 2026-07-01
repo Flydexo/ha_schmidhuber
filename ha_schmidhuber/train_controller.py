@@ -172,6 +172,41 @@ def evaluate(solutions, envs, vae, rnn, cfg, max_steps, avg, profile=False):
     return fit / avg
 
 
+@torch.no_grad()
+def dream_evaluate(solutions, rnn, reward_head, cfg, max_steps, avg):
+    """Fitness by rolling the controller *inside* the MDN-RNN (the paper's "dream").
+
+    No real env: z_{t+1} is sampled from the RNN's mixture and reward is predicted by
+    reward_head(h_t). Pure batched tensor ops, so a full-population rollout is ~ms on GPU.
+
+    NOTE: the CarRacing MDN-RNN only predicts next-z, not reward, so this is meaningful
+    only with a *trained* reward head (models/reward-<run>.pt). With an untrained head it
+    still runs (and is fast) but optimises noise -- it's here for experimentation, not for
+    reproducing the paper score, which is obtained in the real env.
+    """
+    N = len(solutions)
+    in_dim = cfg.controller.state_dim + cfg.controller.hidden_dim
+    out_dim = cfg.controller.action_dim
+    params = torch.tensor(np.array(solutions), dtype=torch.float32, device=cfg.device)
+    W = params[:, :out_dim * in_dim].view(N, out_dim, in_dim)       # (N, 3, 288)
+    b = params[:, out_dim * in_dim:]                                # (N, 3)
+
+    fit = torch.zeros(N, device=cfg.device)
+    for _ in range(avg):
+        z = torch.randn(N, cfg.rnn.z_dim, device=cfg.device)        # seed from the VAE prior N(0, I)
+        h = torch.zeros(N, cfg.controller.hidden_dim, device=cfg.device)
+        hidden = None
+        for _ in range(max_steps):
+            x = torch.cat([z, h], dim=-1).unsqueeze(-1)             # (N, 288, 1)
+            a = torch.bmm(W, x).squeeze(-1) + b                     # (N, 3)
+            a = torch.cat([torch.tanh(a[:, :1]), torch.sigmoid(a[:, 1:])], dim=-1)
+            fit += reward_head(h).squeeze(-1)                       # predicted reward for this step
+            pi, mu, sigma, hidden, out = rnn(z.unsqueeze(1), a.unsqueeze(1), hidden)
+            z = rnn.mdn.sample(pi.squeeze(1), mu.squeeze(1), sigma.squeeze(1))  # dreamed next latent
+            h = out.squeeze(1)
+    return (fit / avg).cpu().numpy()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--generations", type=int, default=300)
@@ -186,6 +221,9 @@ def main():
                    help="torch intra-op threads; keep low so parallelism comes from env processes")
     p.add_argument("--profile", action="store_true",
                    help="print per-generation timing breakdown (reset/forward/step/rnn/prep)")
+    p.add_argument("--dream", action="store_true",
+                   help="train inside the MDN-RNN dream (latent rollouts, no real env; "
+                        "needs models/reward-<run>.pt to be meaningful)")
     args = p.parse_args()
 
     # On a many-core box, torch defaults to one thread per core. For our tiny
@@ -203,6 +241,18 @@ def main():
     rnn.load_state_dict(torch.load(os.path.join(HERE, f"models/rnn-{run}.pt"), weights_only=True, map_location=torch.device(cfg.device)))
     rnn.eval()
 
+    reward_head = None
+    if args.dream:
+        reward_head = nn.Linear(cfg.rnn.hidden_size, 1).to(device)
+        rpath = os.path.join(HERE, f"models/reward-{run}.pt")
+        if os.path.exists(rpath):
+            reward_head.load_state_dict(torch.load(rpath, weights_only=True, map_location=device))
+            print(f"dream: loaded reward head from {rpath}")
+        else:
+            print(f"dream: WARNING no {rpath} -- using an UNTRAINED reward head; "
+                  "fitness is not meaningful (real-env training is what reproduces the paper)")
+        reward_head.eval()
+
     x0 = parameters_to_vector(Controller(cfg).parameters()).detach().numpy()
     opts = {"seed": args.seed}
     if args.popsize is not None:
@@ -211,7 +261,10 @@ def main():
 
     N = es.popsize
     max_steps = args.max_steps
-    if args.render:
+    envs = None
+    if args.dream:
+        pass                                                # no real env in dream mode
+    elif args.render:
         # One human-rendered lane; Sync runs in-process so the window works on macOS.
         fns = [partial(make_env, max_steps, "human")] + \
               [partial(make_env, max_steps) for _ in range(N - 1)]
@@ -219,7 +272,7 @@ def main():
     else:
         envs = gym.vector.AsyncVectorEnv([partial(make_env, max_steps) for _ in range(N)])
     print(f"population={N}  max_steps={max_steps}  avg={args.avg}  "
-          f"render={args.render}  device={device}")
+          f"render={args.render}  dream={args.dream}  device={device}")
 
     use_trackio = True
     try:
@@ -248,7 +301,10 @@ def main():
                 print("CMA stop:", es.stop())
                 break
             solutions = es.ask()
-            fitnesses = evaluate(solutions, envs, vae, rnn, cfg, max_steps, args.avg, args.profile)
+            if args.dream:
+                fitnesses = dream_evaluate(solutions, rnn, reward_head, cfg, max_steps, args.avg)
+            else:
+                fitnesses = evaluate(solutions, envs, vae, rnn, cfg, max_steps, args.avg, args.profile)
             es.tell(solutions, [-f for f in fitnesses])             # CMA minimizes -> negate
 
             mean, gen_best = float(fitnesses.mean()), float(fitnesses.max())
@@ -270,7 +326,8 @@ def main():
                     "cma/sigma": float(es.sigma),
                 })
     finally:
-        envs.close()
+        if envs is not None:
+            envs.close()
         if use_trackio:
             trackio.finish()
 
