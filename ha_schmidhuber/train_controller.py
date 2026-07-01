@@ -15,6 +15,7 @@ used on macOS):
     uv run python train_controller.py --generations 300 --avg 16
 """
 import os
+import time
 import argparse
 from functools import partial
 
@@ -82,40 +83,76 @@ def preprocess(obs_np, cfg):
     return obs / 255
 
 
+def _sync(device):
+    # Make GPU work actually complete so timings aren't misattributed. No-op on CPU.
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
+
+
 @torch.no_grad()
-def _episode(W, b, envs, vae, rnn, cfg, max_steps):
+def _episode(W, b, envs, vae, rnn, cfg, max_steps, profile=False):
     """One batched episode over all N lanes; returns per-lane cumulative reward."""
+    dev = cfg.device
+    t = {"reset": 0.0, "forward": 0.0, "step": 0.0, "rnn": 0.0, "prep": 0.0}
     N = W.shape[0]
+
+    t0 = time.perf_counter()
     obs, _ = envs.reset()
     obs = preprocess(obs, cfg)
+    _sync(dev)
+    t["reset"] += time.perf_counter() - t0
+
     hidden = None                                                    # LSTM (h, c), all lanes
     h = torch.zeros(N, cfg.controller.hidden_dim, device=cfg.device)  # controller input h_t
     total = np.zeros(N, dtype=np.float64)
     active = np.ones(N, dtype=bool)
+    steps = 0
 
     for _ in range(max_steps):
+        t0 = time.perf_counter()
         _, z, _ = vae.encode(obs)                                   # (N, 32) use mu: deterministic latent, no sampling noise
         x = torch.cat([z, h], dim=-1).unsqueeze(-1)                 # (N, 288, 1)
         a = torch.bmm(W, x).squeeze(-1) + b                         # (N, 3) per-candidate linear
         # tanh bounds steering to [-1,1]; sigmoid bounds gas/brake to [0,1]
         a = torch.cat([torch.tanh(a[:, :1]), torch.sigmoid(a[:, 1:])], dim=-1)
+        a_np = a.cpu().numpy().astype(np.float32)
+        _sync(dev)
+        t["forward"] += time.perf_counter() - t0
 
-        obs_np, reward, terminated, truncated, _ = envs.step(a.cpu().numpy().astype(np.float32))
+        t0 = time.perf_counter()
+        obs_np, reward, terminated, truncated, _ = envs.step(a_np)
+        t["step"] += time.perf_counter() - t0
         total += reward * active                                    # freeze reward after a lane finishes
 
+        t0 = time.perf_counter()
         _, _, _, hidden, out = rnn(z.unsqueeze(1), a.unsqueeze(1), hidden)  # out: (N, 1, 256)
         h = out.squeeze(1)
-        obs = preprocess(obs_np, cfg)
+        _sync(dev)
+        t["rnn"] += time.perf_counter() - t0
 
+        t0 = time.perf_counter()
+        obs = preprocess(obs_np, cfg)
+        _sync(dev)
+        t["prep"] += time.perf_counter() - t0
+
+        steps += 1
         active = active & ~(terminated | truncated)
         if not active.any():
             break
+
+    if profile:
+        tot = sum(t.values()) or 1e-9
+        parts = " ".join(f"{k}={v:.2f}s({100*v/tot:.0f}%|{1000*v/steps:.1f}ms/st)"
+                         for k, v in t.items())
+        print(f"[profile] N={N} steps={steps} total={tot:.2f}s  {parts}")
 
     return total
 
 
 @torch.no_grad()
-def evaluate(solutions, envs, vae, rnn, cfg, max_steps, avg):
+def evaluate(solutions, envs, vae, rnn, cfg, max_steps, avg, profile=False):
     """Fitness per candidate, averaged over `avg` rollouts.
 
     mu (deterministic latent) removes VAE sampling noise; averaging over rollouts
@@ -131,7 +168,7 @@ def evaluate(solutions, envs, vae, rnn, cfg, max_steps, avg):
 
     fit = np.zeros(N, dtype=np.float64)
     for _ in range(avg):
-        fit += _episode(W, b, envs, vae, rnn, cfg, max_steps)
+        fit += _episode(W, b, envs, vae, rnn, cfg, max_steps, profile)
     return fit / avg
 
 
@@ -147,6 +184,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--torch-threads", type=int, default=1,
                    help="torch intra-op threads; keep low so parallelism comes from env processes")
+    p.add_argument("--profile", action="store_true",
+                   help="print per-generation timing breakdown (reset/forward/step/rnn/prep)")
     args = p.parse_args()
 
     # On a many-core box, torch defaults to one thread per core. For our tiny
@@ -209,7 +248,7 @@ def main():
                 print("CMA stop:", es.stop())
                 break
             solutions = es.ask()
-            fitnesses = evaluate(solutions, envs, vae, rnn, cfg, max_steps, args.avg)
+            fitnesses = evaluate(solutions, envs, vae, rnn, cfg, max_steps, args.avg, args.profile)
             es.tell(solutions, [-f for f in fitnesses])             # CMA minimizes -> negate
 
             mean, gen_best = float(fitnesses.mean()), float(fitnesses.max())
