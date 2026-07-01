@@ -145,7 +145,13 @@ def main():
     p.add_argument("--render", action="store_true",
                    help="show one env in a window (forces SyncVectorEnv, slower)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--torch-threads", type=int, default=1,
+                   help="torch intra-op threads; keep low so parallelism comes from env processes")
     args = p.parse_args()
+
+    # On a many-core box, torch defaults to one thread per core. For our tiny
+    # per-step batch that is pure overhead and steals cores from the env workers.
+    torch.set_num_threads(args.torch_threads)
 
     cfg = load_cfg()
     run = cfg.trackio.run_name
