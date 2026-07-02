@@ -65,13 +65,22 @@ class AutoEncoder(nn.Module):
         # returns (z, mu, log_sigma)
         return self.dense(self.conv(x))
 
+    @staticmethod
+    def kl_divergence(mu, log_sigma):
+        # Per-sample KL summed over latent dims, then averaged over the batch.
+        # NOTE: this is NOT the standard N(mu, sigma^2) || N(0,1) KL -- it uses exp(log_sigma)
+        # and mu^2 where the standard form has 0.5*sigma^2 and 0.5*mu^2 (the standard KL is the
+        # commented line below). Kept as-is so the training objective is unchanged; posterior
+        # diagnostics in train_vae.py compute the standard per-dim KL separately.
+        return (-log_sigma - 1 + mu.pow(2) + log_sigma.exp()).sum(-1).mean()
+        # standard: (-log_sigma - 0.5 + 0.5*mu.pow(2) + 0.5*(2*log_sigma).exp()).sum(-1).mean()
+
     def forward(self, x):
-        # x.shape = B * C * H * W 
+        # x.shape = B * C * H * W
         z, mu, log_sigma = self.encode(x)
         # (z,mu,log_sigma).shape = B * 32
         x_recon = self.decoder(z)
-        kl = (-log_sigma - 1 + mu.pow(2) + (log_sigma).exp()).sum(-1).mean()
-        #kl = -0.5 * (1 + 2 * log_sigma - mu.pow(2) - (2 * log_sigma).exp()).sum(-1).mean()
+        kl = self.kl_divergence(mu, log_sigma)
         return x_recon, kl
 
 class MDN(nn.Module):

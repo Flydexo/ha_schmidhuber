@@ -30,6 +30,10 @@ from checkpointing import checkpoint_every, latest_checkpoint, load_checkpoint, 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# A latent dim whose mean posterior sigma exceeds this is ~indistinguishable from the
+# N(0,1) prior -- the encoder has stopped encoding information into it (posterior collapse).
+DEAD_SIGMA = 0.9
+
 
 class ShuffledFrameDataset(torch.utils.data.IterableDataset):
     """Streams episodes from LanceDB and yields single frames in shuffled order.
@@ -144,6 +148,7 @@ def main(cfg: DictConfig) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg.training.vae.nb_epochs)
 
     total_steps = cfg.training.vae.nb_epochs * len(train_loader)
+    fb = cfg.training.vae.free_bits_nats   # KL floor in nats when free_bits is on
     ckpt_interval = checkpoint_every(total_steps, pct=0.01)
     ckpt_dir = os.path.join(HERE, "models", f"vae-{run}")
 
@@ -170,7 +175,7 @@ def main(cfg: DictConfig) -> None:
             x_recon, kl = vae(x)
             recon = F.mse_loss(x_recon, x, reduction='sum') / x.shape[0]
             b = beta_schedule(step, total_steps, cfg.training.vae.beta, cfg.training.vae.linear_beta)
-            kl_term = torch.clamp(b * kl, min=32) if cfg.training.vae.free_bits else b * kl
+            kl_term = torch.clamp(b * kl, min=fb) if cfg.training.vae.free_bits else b * kl
             loss = recon + kl_term
 
             optimizer.zero_grad(set_to_none=True)
@@ -188,15 +193,55 @@ def main(cfg: DictConfig) -> None:
                 print(f"checkpoint -> {path}")
 
         vae.eval()
+        # Posterior-collapse diagnostics: accumulate per-dim posterior stats over the val set.
+        z_dim = vae.dense.mu.out_features
+        sig_sum = torch.zeros(z_dim, device=device)
+        mu_sum = torch.zeros(z_dim, device=device)
+        mu_sq_sum = torch.zeros(z_dim, device=device)
+        kl_dim_sum = torch.zeros(z_dim, device=device)
+        n_frames = 0
         with torch.no_grad():
             for x in val_loader:
                 x = x.to(device)
-                x_recon, kl = vae(x)
+                z, mu, log_sigma = vae.encode(x)
+                x_recon = vae.decoder(z)
                 recon = F.mse_loss(x_recon, x, reduction='sum') / x.shape[0]
+                kl = model.AutoEncoder.kl_divergence(mu, log_sigma)
                 # constant beta at eval (no ramp) -- val measures the final objective
-                kl_term = torch.clamp(cfg.training.vae.beta * kl, min=32) if cfg.training.vae.free_bits else cfg.training.vae.beta * kl
+                kl_term = torch.clamp(cfg.training.vae.beta * kl, min=fb) if cfg.training.vae.free_bits else cfg.training.vae.beta * kl
                 loss = recon + kl_term
                 trackio.log({"val-loss": loss.item(), "val-recon": recon.item(), "val-kl": kl.item()})
+
+                sigma = log_sigma.exp()
+                # standard per-dim Gaussian KL(N(mu,sigma^2)||N(0,1)) -- a collapse measure
+                # independent of the (non-standard) training objective above.
+                kl_dim = -log_sigma - 0.5 + 0.5 * mu.pow(2) + 0.5 * sigma.pow(2)
+                sig_sum += sigma.sum(0)
+                mu_sum += mu.sum(0)
+                mu_sq_sum += mu.pow(2).sum(0)
+                kl_dim_sum += kl_dim.sum(0)
+                n_frames += x.shape[0]
+
+        if n_frames:
+            sigma_pd = sig_sum / n_frames                             # mean posterior sigma per dim
+            kl_pd = kl_dim_sum / n_frames                             # mean standard KL per dim
+            mu_var_pd = mu_sq_sum / n_frames - (mu_sum / n_frames).pow(2)  # activity (Var_x E[z|x])
+            dead = sigma_pd > DEAD_SIGMA                              # posterior ~ prior => collapsed
+            n_dead = int(dead.sum())
+            trackio.log({
+                "posterior/mean_sigma": sigma_pd.mean().item(),
+                "posterior/min_sigma": sigma_pd.min().item(),
+                "posterior/max_sigma": sigma_pd.max().item(),
+                "posterior/dead_dims": n_dead,
+                "posterior/active_dims": z_dim - n_dead,
+                "posterior/frac_dead": n_dead / z_dim,
+                "posterior/mean_kl_per_dim": kl_pd.mean().item(),
+                "posterior/mean_mu_var": mu_var_pd.mean().item(),
+            })
+            print(f"[epoch {epoch}] posterior: {n_dead}/{z_dim} dead dims (sigma>{DEAD_SIGMA}), "
+                  f"mean sigma {sigma_pd.mean():.3f}, mean KL/dim {kl_pd.mean():.3f}")
+            print("  sigma/dim:", np.array2string(sigma_pd.cpu().numpy(), precision=3,
+                                                  suppress_small=True, max_line_width=100))
         scheduler.step()
 
     trackio.finish()
