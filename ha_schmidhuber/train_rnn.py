@@ -10,7 +10,6 @@ Run:
     uv run python train_rnn.py training.rnn.resume=true  # resume from latest checkpoint
     uv run python train_rnn.py -m training.rnn.lr=1e-3,3e-4   # Hydra multirun sweep
 """
-import multiprocessing
 import os
 
 import hydra
@@ -116,21 +115,37 @@ def main(cfg: DictConfig) -> None:
 
     # Pre-compute VAE mu for all episodes (once, before training) -- eliminates repeated
     # VAE inference across every epoch. All 1k episodes fit in ~38 MB of RAM.
-    num_workers_pre = min(6, multiprocessing.cpu_count() - 1)
+    #
+    # Reading/decoding episodes from lancedb is CPU/IO-bound while VAE encode is GPU-bound,
+    # so the two need to run at very different granularities to keep the GPU fed:
+    #   - batch_size=episodes_per_batch episodes are pulled per DataLoader item (instead of
+    #     1) so several episodes' worth of frames are concatenated into a single big
+    #     vae.encode() call -- on a big GPU box, a batch_size=1 loader leaves the GPU idle
+    #     between tiny single-episode forward passes (visible as near-0% GPU utilization).
+    #   - num_workers is *not* capped at a small constant: this step is IO/CPU-bound, not
+    #     GPU-bound, so it should use every core available to keep pace with the GPU.
+    num_workers_pre = max(1, (os.cpu_count() or 1) - 1)
+    episodes_per_batch = cfg.training.rnn.precompute_batch_episodes
     pre_kwargs = dict(
-        batch_size=1, collate_fn=lambda b: b[0],
+        batch_size=episodes_per_batch, collate_fn=lambda batch: batch,  # list of (obs, acts), not stacked -- episodes vary in length
         num_workers=num_workers_pre, persistent_workers=num_workers_pre > 0,
         prefetch_factor=4 if num_workers_pre > 0 else None,
         multiprocessing_context='fork' if num_workers_pre > 0 else None,
+        pin_memory=torch.cuda.is_available(),
     )
 
     z_cache, a_cache = [], []
     with torch.no_grad():
-        for obs, acts in tqdm(DataLoader(ds, **pre_kwargs), desc="Pre-computing z"):
-            T = min(obs.shape[0], acts.shape[0])
-            z, _, _ = vae.encode(obs[:T].to(device))
-            z_cache.append(z.cpu())
-            a_cache.append(acts[:T].cpu())
+        for episodes in tqdm(DataLoader(ds, **pre_kwargs), desc="Pre-computing z"):
+            lens = [min(obs.shape[0], acts.shape[0]) for obs, acts in episodes]
+            obs_cat = torch.cat([obs[:T] for (obs, _), T in zip(episodes, lens)]).to(device, non_blocking=True)
+            z_cat, _, _ = vae.encode(obs_cat)     # one forward pass for the whole batch of episodes
+            z_cat = z_cat.cpu()
+            offset = 0
+            for (_, acts), T in zip(episodes, lens):
+                z_cache.append(z_cat[offset:offset + T])
+                a_cache.append(acts[:T])
+                offset += T
 
     z_ds = ZDataset(z_cache, a_cache)
     train_z_ds, val_z_ds = random_split(z_ds, [0.9, 0.1])

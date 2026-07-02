@@ -16,6 +16,7 @@ training:
         batch_size: 8
     rnn:
         nb_epochs: 1
+        precompute_batch_episodes: 4
 controller:
     nb_rollouts: 2
     generations: 3
