@@ -1,0 +1,20 @@
+# @package _global_
+# Fast local smoke test — same code path as `full`, tiny everything so an iteration
+# takes seconds on a laptop. Reuses whatever lancedb is already collected (via
+# dataset.max_episodes) instead of requiring a separate mini dataset.
+defaults:
+    - full
+    - _self_
+
+dataset:
+    episodes: 5
+    max_episode_steps: 50
+    max_episodes: 20
+training:
+    vae:
+        nb_epochs: 1
+        batch_size: 8
+    rnn:
+        nb_epochs: 1
+controller:
+    nb_rollouts: 2

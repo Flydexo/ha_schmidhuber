@@ -68,7 +68,6 @@ class AutoEncoder(nn.Module):
     def forward(self, x):
         # x.shape = B * C * H * W 
         z, mu, log_sigma = self.encode(x)
-        print(z.shape, mu.shape, log_sigma.shape)
         # (z,mu,log_sigma).shape = B * 32
         x_recon = self.decoder(z)
         kl = (-log_sigma - 1 + mu.pow(2) + (log_sigma).exp()).sum(-1).mean()

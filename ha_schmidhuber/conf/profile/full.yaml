@@ -1,0 +1,23 @@
+# @package _global_
+# Full-scale training profile — the real run, on real hardware.
+dataset:
+    episodes: 10000
+    lancedb_uri: 'db'
+    max_episode_steps: 1000
+    img_size: 64
+    max_episodes: null   # cap on episodes read from lancedb for train+val; null = use all
+training:
+    vae:
+        nb_epochs: 1
+        lr: 0.0001
+        linear_beta: false
+        free_bits: false
+        beta: 1.0
+        batch_size: 128
+        resume: false
+    rnn:
+        nb_epochs: 20
+        lr: 0.001
+        resume: false
+controller:
+    nb_rollouts: 100

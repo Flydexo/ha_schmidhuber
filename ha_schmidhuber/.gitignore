@@ -5,3 +5,5 @@ old_db
 **/.ipynb_checkpoints
 *.pt
 __pycache__
+outputs
+multirun

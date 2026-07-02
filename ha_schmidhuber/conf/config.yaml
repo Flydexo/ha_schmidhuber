@@ -1,22 +1,11 @@
+defaults:
+    - profile: full
+    - _self_
+
 trackio:
     write_url: ??
     project: 'ha_schmidhuber'
-    run_name: 'vae{beta=sigmoid,epochs=1}'
-dataset:
-    episodes: 1000
-    lancedb_uri: 'db'
-    max_episode_steps: 1000
-    img_size: 64
-training:
-    vae:
-        nb_epochs: 10
-        lr: 0.0001
-        linear_beta: false
-        free_bits: false
-        batch_size: 128
-    rnn:
-        nb_epochs: 20
-        lr: 0.001
+    run_name: 'vae{beta=1,epochs=1,episodes=1k,freebits=false}'
 rnn:
     hidden_size: 256
     num_mix: 5
@@ -24,7 +13,6 @@ rnn:
     action_dim: 3
     temp: 0.2
 controller:
-    nb_rollouts: 100
     state_dim: 32
     hidden_dim: 256
     action_dim: 3
