@@ -11,6 +11,11 @@ from tqdm.auto import tqdm
 import pyarrow as pa
 import torch.nn.functional as F
 
+try:
+    import envpool               # C++ batched envs; Linux x86_64 only, optional
+except ImportError:
+    envpool = None
+
 with initialize(version_base=None, config_path="conf"):
     load_dotenv()
     write_url = os.environ["TRACKIO_WRITE_URL"]
@@ -29,17 +34,29 @@ with initialize(version_base=None, config_path="conf"):
     tbl = db.create_table("episodes", pa.Table.from_batches([], schema=schema), schema=schema, mode="overwrite")
 
 
-NUM_ENVS = os.cpu_count()
-envs = gym.make_vec(
-    "CarRacing-v3",
-    render_mode="rgb_array",
-    lap_complete_percent=0.95,
-    domain_randomize=False,
-    continuous=True,
-    num_envs=NUM_ENVS,
-    max_episode_steps=MAX_STEPS,
-    vectorization_mode="async"
-)
+USE_ENVPOOL = envpool is not None
+if USE_ENVPOOL:
+    # EnvPool's C++ thread pool oversubscribes fine; more lanes than cores keeps the
+    # pool saturated while some lanes are mid-reset. os.cpu_count() alone leaves a lot
+    # of throughput on the table (this is the fix for the multi-hour, gym.make_vec
+    # async collection: that path pickles rgb_array frames through per-env pipes).
+    NUM_ENVS = os.cpu_count() * 4
+    envs = envpool.make("CarRacing-v3", env_type="gymnasium",
+                         num_envs=NUM_ENVS, max_episode_steps=MAX_STEPS, seed=0)
+else:
+    print("envpool not installed (Linux x86_64 only); falling back to gym.make_vec "
+          "(this will be much slower)")
+    NUM_ENVS = os.cpu_count()
+    envs = gym.make_vec(
+        "CarRacing-v3",
+        render_mode="rgb_array",
+        lap_complete_percent=0.95,
+        domain_randomize=False,
+        continuous=True,
+        num_envs=NUM_ENVS,
+        max_episode_steps=MAX_STEPS,
+        vectorization_mode="async"
+    )
 
 def batch_resize(obs_np):
     """(N, H, W, 3) uint8 → (N, IMG_SIZE, IMG_SIZE, 3) uint8 via a single vectorised call."""
@@ -93,9 +110,11 @@ env_obs  = [[] for _ in range(NUM_ENVS)]
 env_acts = [[] for _ in range(NUM_ENVS)]
 held_action = np.stack([sample_action(rng) for _ in range(NUM_ENVS)])
 hold_left = rng.integers(1, ACTION_REPEAT + 1, size=NUM_ENVS)
-# Gymnasium 1.x vector envs default to NEXT_STEP autoreset: when done[i] is True the
-# returned obs is the *final* frame, and the following step() ignores the action and
-# returns the reset obs. skip[i] marks that phantom reset step so nothing is recorded.
+# Gymnasium 1.x vector envs (gym.make_vec) default to NEXT_STEP autoreset: when done[i]
+# is True the returned obs is the *final* frame, and the following step() ignores the
+# action and returns the reset obs. skip[i] marks that phantom reset step so nothing is
+# recorded. EnvPool resets in-place instead: the obs returned alongside done[i]=True is
+# already the next episode's first frame, so no skip step is needed there.
 skip = np.zeros(NUM_ENVS, dtype=bool)
 write_buffer = []
 total_collected = 0
@@ -135,7 +154,7 @@ while total_collected < cfg.dataset.episodes:
                 np.array(env_acts[i], dtype=np.float32)  # (T, 3)
             ))
             env_obs[i], env_acts[i] = [], []
-            skip[i] = True     # next step() call resets env i — record nothing for it
+            skip[i] = not USE_ENVPOOL   # gym.make_vec needs a phantom reset step; EnvPool doesn't
             hold_left[i] = 0   # new episode starts with a freshly sampled action
             total_collected += 1
             pbar.update(1)
