@@ -58,6 +58,11 @@ class FullEpisodicDataset(torch.utils.data.Dataset):
         return self._len
 
 
+def collate_episode_list(batch):
+    """Identity collate: keep episodes as a plain list, not stacked (variable length)."""
+    return batch
+
+
 class ZDataset(torch.utils.data.Dataset):
     """Pre-computed VAE mu encodings -- lives entirely in CPU RAM (~38 MB for 1k episodes)."""
     def __init__(self, z_list, a_list):
@@ -122,15 +127,18 @@ def main(cfg: DictConfig) -> None:
     #     1) so several episodes' worth of frames are concatenated into a single big
     #     vae.encode() call -- on a big GPU box, a batch_size=1 loader leaves the GPU idle
     #     between tiny single-episode forward passes (visible as near-0% GPU utilization).
-    #   - num_workers is *not* capped at a small constant: this step is IO/CPU-bound, not
-    #     GPU-bound, so it should use every core available to keep pace with the GPU.
-    num_workers_pre = max(1, (os.cpu_count() or 1) - 1)
+    #   - num_workers is capped at a small, fixed count, not one per core: each persistent
+    #     worker buffers prefetch_factor batches of episodes_per_batch full episodes, so
+    #     scaling workers with core count on a big box (32+ cores) would multiply that
+    #     buffering many times over for no real gain past a handful of workers feeding the
+    #     single GPU consumer.
+    num_workers_pre = min(8, max(1, (os.cpu_count() or 1) - 1))
     episodes_per_batch = cfg.training.rnn.precompute_batch_episodes
     pre_kwargs = dict(
-        batch_size=episodes_per_batch, collate_fn=lambda batch: batch,  # list of (obs, acts), not stacked -- episodes vary in length
+        batch_size=episodes_per_batch, collate_fn=collate_episode_list,
         num_workers=num_workers_pre, persistent_workers=num_workers_pre > 0,
         prefetch_factor=4 if num_workers_pre > 0 else None,
-        multiprocessing_context='fork' if num_workers_pre > 0 else None,
+        multiprocessing_context='spawn' if num_workers_pre > 0 else None,
         pin_memory=torch.cuda.is_available(),
     )
 

@@ -133,7 +133,7 @@ def main(cfg: DictConfig) -> None:
         batch_size=batch_size,
         num_workers=num_workers, persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
-        multiprocessing_context='fork' if num_workers > 0 else None,
+        multiprocessing_context='spawn' if num_workers > 0 else None,
     )
     train_loader = DataLoader(train_ds, **loader_kwargs)
     val_loader = DataLoader(val_ds, **loader_kwargs)
