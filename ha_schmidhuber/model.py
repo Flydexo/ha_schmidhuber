@@ -67,13 +67,13 @@ class AutoEncoder(nn.Module):
 
     @staticmethod
     def kl_divergence(mu, log_sigma):
-        # Per-sample KL summed over latent dims, then averaged over the batch.
-        # NOTE: this is NOT the standard N(mu, sigma^2) || N(0,1) KL -- it uses exp(log_sigma)
-        # and mu^2 where the standard form has 0.5*sigma^2 and 0.5*mu^2 (the standard KL is the
-        # commented line below). Kept as-is so the training objective is unchanged; posterior
-        # diagnostics in train_vae.py compute the standard per-dim KL separately.
-        return (-log_sigma - 1 + mu.pow(2) + log_sigma.exp()).sum(-1).mean()
-        # standard: (-log_sigma - 0.5 + 0.5*mu.pow(2) + 0.5*(2*log_sigma).exp()).sum(-1).mean()
+        # KL(N(mu, sigma^2) || N(0,1)) summed over latent dims, averaged over the batch.
+        # log_sigma is log-STD (Dense samples with std = exp(log_sigma)), so variance is
+        # exp(2*log_sigma). This is 2x the textbook KL -- the global 0.5 is dropped to match
+        # the sum-reduced MSE recon (also 2x a unit-variance Gaussian NLL), keeping the recon:KL
+        # scale (and thus beta / the free-bits floor) consistent.
+        var = torch.exp(2 * log_sigma)
+        return (mu.pow(2) + var - 2 * log_sigma - 1).sum(-1).mean()
 
     def forward(self, x):
         # x.shape = B * C * H * W
