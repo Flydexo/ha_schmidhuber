@@ -66,9 +66,13 @@ class AutoEncoder(nn.Module):
         return self.dense(self.conv(x))
 
     def forward(self, x):
+        # x.shape = B * C * H * W 
         z, mu, log_sigma = self.encode(x)
+        print(z.shape, mu.shape, log_sigma.shape)
+        # (z,mu,log_sigma).shape = B * 32
         x_recon = self.decoder(z)
-        kl = -0.5 * (1 + 2 * log_sigma - mu.pow(2) - (2 * log_sigma).exp()).sum(-1).mean()
+        kl = (-log_sigma - 1 + mu.pow(2) + (log_sigma).exp()).sum(-1).mean()
+        #kl = -0.5 * (1 + 2 * log_sigma - mu.pow(2) - (2 * log_sigma).exp()).sum(-1).mean()
         return x_recon, kl
 
 class MDN(nn.Module):
@@ -78,7 +82,7 @@ class MDN(nn.Module):
         self.gaussians = cfg.rnn.num_mix
         self.z_dim = cfg.rnn.z_dim
         self.temp = cfg.rnn.temp
-        self.layer = nn.Sequential(nn.Linear(h, h), nn.ReLU())
+        #self.layer = nn.Sequential(nn.Linear(h, h), nn.ReLU())
         self.probs_layer = nn.Linear(h, self.gaussians)
         self.means = nn.Linear(h, self.gaussians * self.z_dim)
         self.stds = nn.Linear(h, self.gaussians * self.z_dim)
@@ -86,8 +90,9 @@ class MDN(nn.Module):
     def forward(self, x):
         # fix #5: return distribution params for NLL loss, not a sampled point
         # x.shape = (B, 256)
-        x = self.layer(x)
-        pi = F.softmax(self.probs_layer(x) / self.temp, dim=-1)             # (B, 5)
+        #x = self.layer(x)
+        temp = self.temp if not(self.training) else 1
+        pi = F.softmax(self.probs_layer(x) / temp, dim=-1)             # (B, 5)
         mu = self.means(x).view(-1, self.gaussians, self.z_dim)             # (B, 5, 32)
         sigma = torch.exp(self.stds(x)).view(-1, self.gaussians, self.z_dim) # (B, 5, 32)
         return pi, mu, sigma
@@ -98,7 +103,7 @@ class MDN(nn.Module):
         k = torch.multinomial(pi, num_samples=1).squeeze(-1)                # (B,) — hard component draw
         B = mu.shape[0]
         mu_k = mu[torch.arange(B), k]                                       # (B, 32)
-        sigma_k = sigma[torch.arange(B), k] * self.temp                     # (B, 32) — temperature scales uncertainty
+        sigma_k = sigma[torch.arange(B), k]                    # (B, 32) — temperature scales uncertainty
         return Normal(mu_k, sigma_k).sample()                               # (B, 32)
 
     @staticmethod

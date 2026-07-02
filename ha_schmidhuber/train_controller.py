@@ -121,7 +121,7 @@ def run_episode(Wm, bm, vae, rnn, env, cfg, max_steps):
         _, z, _ = vae.encode(obs)                       # mu latent, (1, 32)
         z = z.squeeze(0)                                # (32,)
         a = Wm @ torch.cat([z, h]) + bm                 # (3,)
-        a = torch.cat([torch.tanh(a[:1]), torch.sigmoid(a[1:])])  # steer[-1,1], gas/brake[0,1]
+        a = torch.cat([torch.tanh(a[:1]), torch.clamp(torch.tanh(a[1:]), min=0, max=1)])  # steer[-1,1], gas/brake[0,1]
         obs_np, r, terminated, truncated, _ = env.step(a.cpu().numpy())
         total += r
         _, _, _, hidden, out = rnn(z.view(1, 1, -1), a.view(1, 1, -1), hidden)
