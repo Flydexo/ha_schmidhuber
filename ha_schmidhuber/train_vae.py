@@ -59,8 +59,10 @@ class ShuffledFrameDataset(torch.utils.data.IterableDataset):
 
     def _episode_frames(self, table, ep_id):
         row = table.search().where(f'episode_id = {ep_id}').limit(1).to_arrow()
-        frames = np.array(row.column('observations').combine_chunks()[0].as_py(), dtype=np.uint8)
-        frames = frames.reshape(-1, self.img_size, self.img_size, 3)
+        # Decode straight from the arrow buffers -- .as_py() materialises every pixel as a
+        # Python object (~2.4 s per 12 MB episode, measured); the buffer view is ~1 ms.
+        obs_list = row.column('observations')[0].values   # FixedSizeListArray (T, img*img*3)
+        frames = obs_list.values.to_numpy(zero_copy_only=False).reshape(len(obs_list), self.img_size, self.img_size, 3)
         # Truncate to max_episode_steps even if the stored episode is longer (e.g. the
         # smoke profile re-reads a full-length dataset but wants short episodes).
         return frames[:self.max_episode_steps]

@@ -44,15 +44,20 @@ class FullEpisodicDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         episode = self._get_table().search().where(f'episode_id = {idx}').limit(1).to_arrow()
-        frames_np = np.array(episode.column('observations').combine_chunks()[0].as_py(), dtype=np.uint8).reshape(-1, self.img_size, self.img_size, 3)
-        actions_np = np.array(episode.column('actions').combine_chunks()[0].as_py(), dtype=np.float32)
+        # Decode straight from the arrow buffers -- .as_py() materialises every pixel as a
+        # Python object (~2.4 s per 12 MB episode, measured); the buffer view is ~1 ms.
+        obs_list = episode.column('observations')[0].values   # FixedSizeListArray (T, img*img*3)
+        act_list = episode.column('actions')[0].values        # FixedSizeListArray (T, 3)
+        frames_np = obs_list.values.to_numpy(zero_copy_only=False).reshape(len(obs_list), self.img_size, self.img_size, 3)
+        actions_np = act_list.values.to_numpy(zero_copy_only=False).reshape(len(act_list), -1)
         # Truncate to max_episode_steps even if the stored episode is longer (e.g. the
         # smoke profile re-reads a full-length dataset but wants short episodes).
-        frames_np = frames_np[:self.max_episode_steps]
-        actions_np = actions_np[:self.max_episode_steps]
-        obs = torch.from_numpy(frames_np).clone().permute(0, 3, 1, 2).to(torch.float32) / 255
-        acts = torch.from_numpy(actions_np).clone()
-        return obs, acts
+        # .copy() detaches from the read-only arrow buffer (torch needs writable memory).
+        frames_np = frames_np[:self.max_episode_steps].copy()
+        actions_np = actions_np[:self.max_episode_steps].astype(np.float32)
+        # Keep obs uint8 HWC here: float32 CHW would 4x the worker->main IPC, the pinned
+        # prefetch buffers, and the PCIe transfer. The GPU does the float conversion.
+        return torch.from_numpy(frames_np), torch.from_numpy(actions_np)
 
     def __len__(self):
         return self._len
@@ -137,7 +142,9 @@ def main(cfg: DictConfig) -> None:
     pre_kwargs = dict(
         batch_size=episodes_per_batch, collate_fn=collate_episode_list,
         num_workers=num_workers_pre, persistent_workers=num_workers_pre > 0,
-        prefetch_factor=4 if num_workers_pre > 0 else None,
+        # 2 is plenty now that reads are query-bound (~0.1 s/episode); each buffered batch
+        # is episodes_per_batch x ~12 MB of uint8, so deeper prefetch just burns RAM.
+        prefetch_factor=2 if num_workers_pre > 0 else None,
         multiprocessing_context='spawn' if num_workers_pre > 0 else None,
         pin_memory=torch.cuda.is_available(),
     )
@@ -147,6 +154,8 @@ def main(cfg: DictConfig) -> None:
         for episodes in tqdm(DataLoader(ds, **pre_kwargs), desc="Pre-computing z"):
             lens = [min(obs.shape[0], acts.shape[0]) for obs, acts in episodes]
             obs_cat = torch.cat([obs[:T] for (obs, _), T in zip(episodes, lens)]).to(device, non_blocking=True)
+            # uint8 HWC -> float CHW in [0,1] on the GPU (cheap there; 4x less PCIe traffic)
+            obs_cat = obs_cat.permute(0, 3, 1, 2).float().div_(255)
             z_cat, _, _ = vae.encode(obs_cat)     # one forward pass for the whole batch of episodes
             z_cat = z_cat.cpu()
             offset = 0
