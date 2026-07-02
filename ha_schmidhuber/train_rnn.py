@@ -105,7 +105,7 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(0)
 
     vae = model.AutoEncoder(cfg).to(device)
-    vae.load_state_dict(torch.load(os.path.join(HERE, "models", f"vae-{run}.pt"), map_location=device, weights_only=True))
+    vae.load_state_dict(torch.load(os.path.join(HERE, cfg.rnn.vae_path), map_location=device, weights_only=True))
     vae.eval()
 
     rnn = model.RNN(cfg).to(device)

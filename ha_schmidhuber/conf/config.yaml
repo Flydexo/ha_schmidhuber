@@ -5,8 +5,9 @@ defaults:
 trackio:
     write_url: ??
     project: 'ha_schmidhuber'
-    run_name: 'vae{beta=1,epochs=1,episodes=1k,freebits=false}'
+    run_name: 'rnn{epochs=20,episodes=1k}'
 rnn:
+    vae_path: ??
     hidden_size: 256
     num_mix: 5
     z_dim: 32
@@ -16,4 +17,6 @@ controller:
     state_dim: 32
     hidden_dim: 256
     action_dim: 3
+    vae_path: ??
+    rnn_path: ??
 device: 'mps'

@@ -12,7 +12,9 @@ scales linearly with cores. With popsize P and avg A, each generation submits P*
 independent single-episode tasks, so the avg rollouts parallelise across cores too.
 
 Run as a module (the __main__ guard is required for the 'spawn' start method):
-    uv run python train_controller.py --generations 1800 --popsize 64 --avg 16
+    uv run python train_controller.py controller.vae_path=models/vae-<run>.pt \
+        controller.rnn_path=models/rnn-<run>.pt controller.generations=1800 \
+        controller.popsize=64 controller.avg=16
 
 Real-env backends:
     EnvPool (default when installed, Linux x86_64): one batched C++ CarRacing vector
@@ -20,29 +22,31 @@ Real-env backends:
         Kills both the Python IPC and pygame's slow software rendering.
     multiprocessing Pool (fallback, e.g. macOS): one whole rollout per worker process.
 
-Modes:
-    (default)     real-env training (EnvPool or Pool per above)
-    --no-envpool  force the multiprocessing Pool path
-    --dream       roll out inside the MDN-RNN on the GPU (no env); needs a reward head
-    --render      watch the saved controller drive in a window (no training)
-    --check-align encode+decode EnvPool frames through the VAE to verify gym alignment
+Modes (all Hydra overrides, e.g. `controller.render=true`):
+    (default)               real-env training (EnvPool or Pool per above)
+    controller.use_envpool=false   force the multiprocessing worker-per-rollout path
+    controller.dream=true          roll out inside the MDN-RNN on the GPU (no env);
+                                    needs a reward head
+    controller.render=true         watch the saved controller drive in a window; no training
+    controller.check_align=true    encode+decode EnvPool frames through the VAE to verify
+                                    gym alignment
 """
 import os
 import time
-import argparse
 from multiprocessing import get_context
 
+import cma
+import gymnasium as gym
+import hydra
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gymnasium as gym
-import cma
-from torch.nn.utils import parameters_to_vector, vector_to_parameters
-from hydra import initialize_config_dir, compose
-from dotenv import load_dotenv
-from tqdm import tqdm
 import trackio
+from dotenv import load_dotenv
+from omegaconf import DictConfig
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+from tqdm import tqdm
 
 import model
 
@@ -52,16 +56,6 @@ except ImportError:
     envpool = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def load_cfg():
-    load_dotenv(os.path.join(HERE, ".env"))
-    with initialize_config_dir(version_base=None, config_dir=os.path.join(HERE, "conf")):
-        overrides = []
-        url = os.environ.get("TRACKIO_WRITE_URL")
-        if url:
-            overrides.append(f'trackio.write_url="{url}"')
-        return compose(config_name="config", overrides=overrides)
 
 
 class Controller(nn.Module):
@@ -226,7 +220,7 @@ def evaluate_envpool(envs, solutions, vae, rnn, cfg, max_steps, avg):
 
 
 @torch.no_grad()
-def check_align(run, cfg, steps=60, n=4):
+def check_align(cfg, steps=60, n=4):
     """Sanity-check EnvPool frames against the VAE (trained on gym frames).
 
     Steps an EnvPool CarRacing, then encodes+decodes the frames; if the reconstruction
@@ -243,7 +237,7 @@ def check_align(run, cfg, steps=60, n=4):
         obs = envs.step(act)[0]
 
     vae = model.AutoEncoder(cfg)
-    vae.load_state_dict(torch.load(os.path.join(HERE, f"models/vae-{run}.pt"), map_location="cpu", weights_only=True))
+    vae.load_state_dict(torch.load(os.path.join(HERE, cfg.controller.vae_path), map_location="cpu", weights_only=True))
     vae.eval()
     x = _prep_batch(obs, cfg, torch.device("cpu"))                # (n, 3, 64, 64)
     xr, _ = vae(x)
@@ -307,10 +301,10 @@ def watch(run, cfg, max_steps, episodes=5):
     Wm, bm = ctrl.layer.weight.detach(), ctrl.layer.bias.detach()
 
     vae = model.AutoEncoder(cfg)
-    vae.load_state_dict(torch.load(os.path.join(HERE, f"models/vae-{run}.pt"), map_location="cpu", weights_only=True))
+    vae.load_state_dict(torch.load(os.path.join(HERE, cfg.controller.vae_path), map_location="cpu", weights_only=True))
     vae.eval()
     rnn = model.RNN(cfg)
-    rnn.load_state_dict(torch.load(os.path.join(HERE, f"models/rnn-{run}.pt"), map_location="cpu", weights_only=True))
+    rnn.load_state_dict(torch.load(os.path.join(HERE, cfg.controller.rnn_path), map_location="cpu", weights_only=True))
     rnn.eval()
 
     env = make_env(max_steps, "human")
@@ -319,62 +313,46 @@ def watch(run, cfg, max_steps, episodes=5):
     env.close()
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--generations", type=int, default=300)
-    p.add_argument("--popsize", type=int, default=None, help="CMA population (default: cma's own)")
-    p.add_argument("--sigma", type=float, default=0.3, help="CMA initial step size")
-    p.add_argument("--max-steps", type=int, default=1000, help="steps per rollout (paper: 1000)")
-    p.add_argument("--avg", type=int, default=16, help="rollouts averaged per candidate (paper: 16)")
-    p.add_argument("--workers", type=int, default=None, help="pool size (default: os.cpu_count())")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--render", action="store_true", help="watch the saved controller drive; no training")
-    p.add_argument("--profile", action="store_true", help="print rollouts/s each generation")
-    p.add_argument("--dream", action="store_true",
-                   help="train inside the MDN-RNN dream (latent rollouts, no real env; "
-                        "needs models/reward-<run>.pt to be meaningful)")
-    p.add_argument("--envpool", dest="use_envpool", action="store_true", default=None,
-                   help="use the batched EnvPool CarRacing (Linux x86_64; default: on if installed)")
-    p.add_argument("--no-envpool", dest="use_envpool", action="store_false",
-                   help="force the multiprocessing worker-per-rollout path")
-    p.add_argument("--check-align", action="store_true",
-                   help="encode+decode EnvPool frames through the VAE to check gym alignment, then exit")
-    args = p.parse_args()
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig) -> None:
+    load_dotenv(os.path.join(HERE, ".env"))
+    url = os.environ.get("TRACKIO_WRITE_URL")
+    if url:
+        cfg.trackio.write_url = url
 
-    cfg = load_cfg()
     run = cfg.trackio.run_name
     device = cfg.device
-    max_steps = args.max_steps
+    max_steps = cfg.controller.max_steps
+    vae_path = os.path.join(HERE, cfg.controller.vae_path)
+    rnn_path = os.path.join(HERE, cfg.controller.rnn_path)
 
-    if args.render:
+    if cfg.controller.render:
         watch(run, cfg, max_steps)
         return
-    if args.check_align:
-        check_align(run, cfg)
+    if cfg.controller.check_align:
+        check_align(cfg)
         return
 
     # Pick the real-env backend: EnvPool by default when installed (Linux x86_64),
     # otherwise the multiprocessing worker-per-rollout pool. Dream ignores both.
-    use_envpool = args.use_envpool
+    use_envpool = cfg.controller.use_envpool
     if use_envpool is None:
-        use_envpool = envpool is not None and not args.dream
+        use_envpool = envpool is not None and not cfg.controller.dream
     if use_envpool and envpool is None:
         print("envpool not installed (Linux x86_64 only); falling back to worker pool")
         use_envpool = False
 
     # EnvPool and dream both run a batched forward in the main process on `device`.
     vae = rnn = reward_head = None
-    if args.dream or use_envpool:
+    if cfg.controller.dream or use_envpool:
         rnn = model.RNN(cfg).to(device)
-        rnn.load_state_dict(torch.load(os.path.join(HERE, f"models/rnn-{run}.pt"),
-                                       weights_only=True, map_location=device))
+        rnn.load_state_dict(torch.load(rnn_path, weights_only=True, map_location=device))
         rnn.eval()
     if use_envpool:
         vae = model.AutoEncoder(cfg).to(device)
-        vae.load_state_dict(torch.load(os.path.join(HERE, f"models/vae-{run}.pt"),
-                                       weights_only=True, map_location=device))
+        vae.load_state_dict(torch.load(vae_path, weights_only=True, map_location=device))
         vae.eval()
-    if args.dream:
+    if cfg.controller.dream:
         reward_head = nn.Linear(cfg.rnn.hidden_size, 1).to(device)
         rpath = os.path.join(HERE, f"models/reward-{run}.pt")
         if os.path.exists(rpath):
@@ -386,44 +364,43 @@ def main():
         reward_head.eval()
 
     x0 = parameters_to_vector(Controller(cfg).parameters()).detach().numpy()
-    opts = {"seed": args.seed}
-    if args.popsize is not None:
-        opts["popsize"] = args.popsize
-    es = cma.CMAEvolutionStrategy(x0, args.sigma, opts)
+    opts = {"seed": cfg.controller.seed}
+    if cfg.controller.popsize is not None:
+        opts["popsize"] = cfg.controller.popsize
+    es = cma.CMAEvolutionStrategy(x0, cfg.controller.sigma, opts)
     N = es.popsize
 
     ckpt_dir = os.path.join(HERE, f"models/controller-{run}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
     pool = envs_ep = None
-    if args.dream:
-        print(f"DREAM  population={N}  avg={args.avg}  max_steps={max_steps}  device={device}")
+    if cfg.controller.dream:
+        print(f"DREAM  population={N}  avg={cfg.controller.avg}  max_steps={max_steps}  device={device}")
     elif use_envpool:
-        envs_ep = make_envpool(N, max_steps, args.seed)
-        print(f"envpool  population={N}  avg={args.avg}  max_steps={max_steps}  device={device}")
+        envs_ep = make_envpool(N, max_steps, cfg.controller.seed)
+        print(f"envpool  population={N}  avg={cfg.controller.avg}  max_steps={max_steps}  device={device}")
     else:
-        workers = args.workers or os.cpu_count()
+        workers = cfg.controller.workers or os.cpu_count()
         pool = get_context("spawn").Pool(
             processes=workers, initializer=_worker_init,
-            initargs=(cfg, os.path.join(HERE, f"models/vae-{run}.pt"),
-                      os.path.join(HERE, f"models/rnn-{run}.pt"), max_steps),
+            initargs=(cfg, vae_path, rnn_path, max_steps),
         )
-        print(f"pool  workers={workers}  population={N}  avg={args.avg}  max_steps={max_steps}")
+        print(f"pool  workers={workers}  population={N}  avg={cfg.controller.avg}  max_steps={max_steps}")
 
     use_trackio = True
     try:
         trackio.init(
             name=f"controller-{run}", project=cfg.trackio.project, server_url=cfg.trackio.write_url,
-            config={"generations": args.generations, "popsize": N, "sigma": args.sigma,
-                    "seed": args.seed, "max_steps": max_steps, "avg": args.avg,
-                    "workers": args.workers, "dream": args.dream, "envpool": use_envpool},
+            config={"generations": cfg.controller.generations, "popsize": N, "sigma": cfg.controller.sigma,
+                    "seed": cfg.controller.seed, "max_steps": max_steps, "avg": cfg.controller.avg,
+                    "workers": cfg.controller.workers, "dream": cfg.controller.dream, "envpool": use_envpool},
         )
     except Exception as e:
         use_trackio = False
         print(f"trackio disabled: {e}")
 
     best_ever = -np.inf
-    pbar = tqdm(range(args.generations), desc="CMA")
+    pbar = tqdm(range(cfg.controller.generations), desc="CMA")
     try:
         for gen in pbar:
             if es.stop():
@@ -431,12 +408,12 @@ def main():
                 break
             solutions = es.ask()
             t0 = time.perf_counter()
-            if args.dream:
-                fitnesses = dream_evaluate(solutions, rnn, reward_head, cfg, max_steps, args.avg)
+            if cfg.controller.dream:
+                fitnesses = dream_evaluate(solutions, rnn, reward_head, cfg, max_steps, cfg.controller.avg)
             elif use_envpool:
-                fitnesses = evaluate_envpool(envs_ep, solutions, vae, rnn, cfg, max_steps, args.avg)
+                fitnesses = evaluate_envpool(envs_ep, solutions, vae, rnn, cfg, max_steps, cfg.controller.avg)
             else:
-                fitnesses = evaluate_pool(pool, solutions, args.avg)
+                fitnesses = evaluate_pool(pool, solutions, cfg.controller.avg)
             dt = time.perf_counter() - t0
             es.tell(solutions, [-f for f in fitnesses])             # CMA minimizes -> negate
 
@@ -454,8 +431,8 @@ def main():
                 torch.save({"gen": gen + 1, "best_ever": best_ever,
                             "state_dict": ckpt_ctrl.state_dict()},
                            os.path.join(ckpt_dir, f"checkpoint-{gen + 1}.pt"))
-            if args.profile:
-                nroll = len(solutions) * args.avg
+            if cfg.controller.perf_profile:
+                nroll = len(solutions) * cfg.controller.avg
                 print(f"[profile] {nroll} rollouts in {dt:.1f}s = {nroll/dt:.1f} rollouts/s")
             if use_trackio:
                 trackio.log({"reward/mean": mean, "reward/gen_best": gen_best,

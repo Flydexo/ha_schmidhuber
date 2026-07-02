@@ -21,3 +21,15 @@ training:
         resume: false
 controller:
     nb_rollouts: 100
+    generations: 300
+    popsize: null      # null = CMA's own default popsize
+    sigma: 0.3         # CMA initial step size
+    max_steps: 1000    # steps per rollout (paper: 1000)
+    avg: 16            # rollouts averaged per candidate (paper: 16)
+    workers: null      # pool size; null = os.cpu_count()
+    seed: 0
+    render: false      # watch the saved controller drive; no training
+    dream: false       # train inside the MDN-RNN dream (latent rollouts, no real env)
+    use_envpool: null  # null = auto (on if installed and not dream); true/false to force
+    check_align: false # encode+decode EnvPool frames through the VAE, then exit
+    perf_profile: false  # print rollouts/s each generation

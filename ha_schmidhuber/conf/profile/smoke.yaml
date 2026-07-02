@@ -18,3 +18,7 @@ training:
         nb_epochs: 1
 controller:
     nb_rollouts: 2
+    generations: 3
+    popsize: 4
+    max_steps: 50
+    avg: 2
