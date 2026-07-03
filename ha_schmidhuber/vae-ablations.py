@@ -2,7 +2,7 @@ import subprocess
 import sys
 
 GRID = [
-    "training.vae.beta=0.5,1.0,2.0",
+    "training.vae.beta=1.0,2.0",
     "training.vae.free_bits=true,false",
     'training.vae.beta_schedule="constant","tanh","sigmoid"',
     "training.vae.lambda=0.125,0.25,0.5,1,2",
@@ -23,7 +23,7 @@ def main():
         *GRID,
         RUN_NAME_OVERRIDE,
         *sys.argv[1:],
-        "training.vae.batch_size=4096",
+        "training.vae.batch_size=2048",
     ]
     print(f"$ {' '.join(cmd)}")
     sys.exit(subprocess.run(cmd).returncode)
