@@ -1,39 +1,40 @@
 # @package _global_
 # Full-scale training profile — the real run, on real hardware.
 dataset:
-    episodes: 10000
-    lancedb_uri: 'db'
-    max_episode_steps: 1000
-    img_size: 64
-    max_episodes: null   # cap on episodes read from lancedb for train+val; null = use all
+  episodes: 1000
+  lancedb_uri: "db"
+  max_episode_steps: 1000
+  img_size: 64
+  max_episodes: null # cap on episodes read from lancedb for train+val; null = use all
 training:
-    vae:
-        nb_epochs: 1
-        lr: 0.0001
-        linear_beta: false
-        free_bits: false        # toggle the free-bits KL floor on/off
-        free_bits_nats: 32      # floor (in nats) for the total KL term when free_bits=true
-        beta: 1.0
-        batch_size: 128
-        resume: false
-    rnn:
-        nb_epochs: 20
-        lr: 0.001
-        resume: false
-        precompute_batch_episodes: 32   # episodes concatenated into one VAE encode() call
-                                         # when pre-computing z (32 eps x 1000 frames ~ a few
-                                         # GB of activations) -- raise on a bigger GPU
+  vae:
+    nb_epochs: 1
+    lr: 0.0001
+    beta_schedule: "constant"
+    free_bits: false # toggle the free-bits KL floor on/off
+    lambda: 1 # floor (in nats) for the total KL term when free_bits=true
+    beta: 1.0
+    batch_size: 128
+    resume: false
+  rnn:
+    nb_epochs: 20
+    lr: 0.001
+    resume: false
+    precompute_batch_episodes:
+      32 # episodes concatenated into one VAE encode() call
+      # when pre-computing z (32 eps x 1000 frames ~ a few
+      # GB of activations) -- raise on a bigger GPU
 controller:
-    nb_rollouts: 100
-    generations: 300
-    popsize: null      # null = CMA's own default popsize
-    sigma: 0.3         # CMA initial step size
-    max_steps: 1000    # steps per rollout (paper: 1000)
-    avg: 16            # rollouts averaged per candidate (paper: 16)
-    workers: null      # pool size; null = os.cpu_count()
-    seed: 0
-    render: false      # watch the saved controller drive; no training
-    dream: false       # train inside the MDN-RNN dream (latent rollouts, no real env)
-    use_envpool: null  # null = auto (on if installed and not dream); true/false to force
-    check_align: false # encode+decode EnvPool frames through the VAE, then exit
-    perf_profile: false  # print rollouts/s each generation
+  nb_rollouts: 100
+  generations: 300
+  popsize: null # null = CMA's own default popsize
+  sigma: 0.3 # CMA initial step size
+  max_steps: 1000 # steps per rollout (paper: 1000)
+  avg: 16 # rollouts averaged per candidate (paper: 16)
+  workers: null # pool size; null = os.cpu_count()
+  seed: 0
+  render: false # watch the saved controller drive; no training
+  dream: false # train inside the MDN-RNN dream (latent rollouts, no real env)
+  use_envpool: null # null = auto (on if installed and not dream); true/false to force
+  check_align: false # encode+decode EnvPool frames through the VAE, then exit
+  perf_profile: false # print rollouts/s each generation
