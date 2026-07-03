@@ -23,6 +23,7 @@ def main():
         *GRID,
         RUN_NAME_OVERRIDE,
         *sys.argv[1:],
+        "training.vae.batch_size=4096",
     ]
     print(f"$ {' '.join(cmd)}")
     sys.exit(subprocess.run(cmd).returncode)

@@ -69,6 +69,7 @@ class AutoEncoder(nn.Module):
         return self.dense(self.conv(x))
 
     @staticmethod
+    @torch.compile
     def kl_divergence(mu, log_sigma):
         # KL(N(mu, sigma^2) || N(0,1)) summed over latent dims, averaged over the batch.
         # log_sigma is log-STD (Dense samples with std = exp(log_sigma)), so variance is

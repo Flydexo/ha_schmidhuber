@@ -84,12 +84,10 @@ class ShuffledFrameDataset(torch.utils.data.IterableDataset):
             buffer[j], buffer[-1] = buffer[-1], buffer[j]  # swap-pop a random frame
             frame = buffer.pop()
             # copy() detaches the 12 KB frame from its 12 MB parent episode array
-            yield (
-                torch.from_numpy(frame.copy()).to(self.device).permute(2, 0, 1).float()
-                / 255.0
-            )
+            yield (torch.from_numpy(frame.copy()).permute(2, 0, 1).float() / 255.0)
 
 
+@torch.compile
 def beta_schedule(step, total_steps, target_beta, schedule):
     """Constant target_beta, or a linear 0 -> target_beta ramp over the whole run."""
     if schedule == "linear":
@@ -99,6 +97,16 @@ def beta_schedule(step, total_steps, target_beta, schedule):
     elif schedule == "sigmoid":
         return target_beta * torch.sigmoid(12 * step / total_steps - 6)
     return target_beta
+
+
+@torch.compile
+def loss_fn(cfg, step, total_steps, fb, x, x_recon, kl):
+    recon = 0.5 * F.mse_loss(x_recon, x, reduction="sum") / x.shape[0]
+    b = beta_schedule(
+        step, total_steps, cfg.training.vae.beta, cfg.training.vae.beta_schedule
+    )
+    kl_term = torch.clamp(b * kl, min=fb) if cfg.training.vae.free_bits else b * kl
+    return recon + kl_term, recon, kl_term
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
@@ -151,7 +159,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     total_steps = cfg.training.vae.nb_epochs * len(train_loader)
-    fb = 32 * cfg.training.vae.get("lambfa")  # KL floor in nats when free_bits is on
+    fb = 32 * cfg.training.vae.get("lambda")  # KL floor in nats when free_bits is on
     ckpt_interval = checkpoint_every(total_steps, pct=0.01)
     ckpt_dir = os.path.join(HERE, "models", f"vae-{run}")
 
@@ -180,15 +188,9 @@ def main(cfg: DictConfig) -> None:
         vae.train()
         for x in train_loader:
             # (B, 3, H, W) float32 in [0,1], frames from ~dozens of episodes
+            x = x.to(device)
             x_recon, kl = vae(x)
-            recon = F.mse_loss(x_recon, x, reduction="sum") / x.shape[0]
-            b = beta_schedule(
-                step, total_steps, cfg.training.vae.beta, cfg.training.vae.beta_schedule
-            )
-            kl_term = (
-                torch.clamp(b * kl, min=fb) if cfg.training.vae.free_bits else b * kl
-            )
-            loss = recon + kl_term
+            loss, recon, _ = loss_fn(cfg, step, total_steps, fb, x, x_recon, kl)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -198,6 +200,8 @@ def main(cfg: DictConfig) -> None:
                     "training-loss": loss.item(),
                     "training-recon": recon.item(),
                     "training-kl": kl.item(),
+                    "episode": step * batch_size / 1000,
+                    "frame": step * batch_size,
                 }
             )
             step += 1
@@ -224,7 +228,7 @@ def main(cfg: DictConfig) -> None:
         n_frames = 0
         with torch.no_grad():
             for x in val_loader:
-                x = x
+                x = x.to(device)
                 z, mu, log_sigma = vae.encode(x)
                 x_recon = vae.decoder(z)
                 recon = 0.5 * F.mse_loss(x_recon, x, reduction="sum") / x.shape[0]
