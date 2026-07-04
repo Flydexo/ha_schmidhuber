@@ -144,6 +144,19 @@ that defines "solved."
 
 </div>
 
+### 🎥 The full loop, live
+
+<div align="center">
+<img src="evaluations/controller_triptych.gif" alt="Controller-driven episode: real frame, VAE reconstruction, and MDN-RNN one-step-ahead prediction" width="100%"/>
+<br/>
+<sub><b>left:</b> what the car sees &nbsp;·&nbsp; <b>middle:</b> the frame round-tripped through <b>V</b> (VAE) &nbsp;·&nbsp; <b>right:</b> the next frame as <b>M</b> (MDN-RNN) predicts it, one step ahead</sub>
+</div>
+
+An episode driven by `controller-controller-2` (V = `vae.pt`, M = `rnn-rnn{epochs=20,episodes=1k}`).
+The middle panel shows the β-VAE's lossy-but-faithful reconstruction of each frame; the right panel
+is the MDN-RNN's *teacher-forced* prediction of the **next** latent, decoded through the same VAE —
+the memory module imagining one frame into the future.
+
 ### 📊 Live dashboard — CMA-ES reward curves
 
 <iframe
