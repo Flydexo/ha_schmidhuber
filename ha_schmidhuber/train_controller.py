@@ -390,7 +390,7 @@ def main(cfg: DictConfig) -> None:
     use_trackio = True
     try:
         trackio.init(
-            name=f"controller-{run}", project=cfg.trackio.project, server_url=cfg.trackio.write_url,
+            name=f"controller-{run}", project=cfg.trackio.project+"-controller", server_url=cfg.trackio.write_url,
             config={"generations": cfg.controller.generations, "popsize": N, "sigma": cfg.controller.sigma,
                     "seed": cfg.controller.seed, "max_steps": max_steps, "avg": cfg.controller.avg,
                     "workers": cfg.controller.workers, "dream": cfg.controller.dream, "envpool": use_envpool},
